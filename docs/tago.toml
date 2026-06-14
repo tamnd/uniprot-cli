@@ -1,0 +1,10 @@
+title       = "uniprot"
+baseURL     = "https://uniprot-cli.tamnd.com/"
+description = "A command line for uniprot."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/uniprot-cli"
