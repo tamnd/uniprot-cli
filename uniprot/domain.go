@@ -2,7 +2,9 @@ package uniprot
 
 import (
 	"context"
+	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +21,6 @@ import (
 // uniprot:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone uniprot binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the uniprot driver. It carries no state; the per-run client is
@@ -36,10 +35,10 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "uniprot",
-			Short:  "A command line for uniprot.",
-			Long: `A command line for uniprot.
+			Short:  "A command line for UniProt protein database.",
+			Long: `A command line for UniProt protein database.
 
-uniprot reads public uniprot data over plain HTTPS, shapes it into
+uniprot reads public UniProt data over HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,28 +47,44 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `uniprot page` and
-	// `ant get uniprot://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// protein: fetch one protein record by accession.
+	kit.Handle(app, kit.OpMeta{
+		Name:     "protein",
+		Group:    "read",
+		Single:   true,
+		Summary:  "Fetch a protein by accession (e.g. P04637, Q9Y2T1)",
+		URIType:  "protein",
+		Resolver: true,
+		Args:     []kit.Arg{{Name: "accession", Help: "UniProt accession ID"}},
+	}, getProtein)
 
-	// List op: members of a page, the home of `uniprot links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// uniprot://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// search: full-text search over UniProt proteins.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search proteins by gene name, keyword, or query",
+		URIType: "protein",
+		Args:    []kit.Arg{{Name: "query", Help: "search query (e.g. BRCA1 AND organism_id:9606)"}},
+	}, searchProteins)
+
+	// taxonomy: fetch organism taxonomy info by taxon ID.
+	kit.Handle(app, kit.OpMeta{
+		Name:     "taxonomy",
+		Group:    "read",
+		Single:   true,
+		Summary:  "Fetch organism taxonomy info by taxon ID (e.g. 9606 for human)",
+		URIType:  "taxonomy",
+		Resolver: true,
+		Args:     []kit.Arg{{Name: "taxon-id", Help: "NCBI taxon ID (integer)"}},
+	}, getTaxonomy)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,39 +103,47 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type proteinRef struct {
+	Accession string  `kit:"arg" help:"UniProt accession ID"`
+	Client    *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Query    string  `kit:"arg" help:"search query"`
+	Limit    int     `kit:"flag" help:"max results to return"`
+	Reviewed bool    `kit:"flag" help:"only return reviewed (Swiss-Prot) entries"`
+	Client   *Client `kit:"inject"`
+}
+
+type taxonomyRef struct {
+	TaxonID string  `kit:"arg" help:"NCBI taxon ID (integer)"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func getProtein(ctx context.Context, in proteinRef, emit func(*Protein) error) error {
+	p, err := in.Client.Protein(ctx, in.Accession)
 	if err != nil {
 		return mapErr(err)
 	}
 	return emit(p)
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func searchProteins(ctx context.Context, in searchInput, emit func(*Protein) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	results, err := in.Client.Search(ctx, in.Query, SearchOptions{
+		Limit:    limit,
+		Reviewed: in.Reviewed,
+	})
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
+	for _, p := range results {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +151,91 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full uniprot.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized uniprot reference: %q", input)
+func getTaxonomy(ctx context.Context, in taxonomyRef, emit func(*Taxonomy) error) error {
+	taxonID, err := strconv.Atoi(strings.TrimSpace(in.TaxonID))
+	if err != nil {
+		return errs.Usage("taxon-id must be an integer, got %q", in.TaxonID)
 	}
-	return "page", id, nil
+	t, err := in.Client.Taxonomy(ctx, taxonID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(t)
+}
+
+// --- Resolver: URI string functions, pure and network-free ---
+
+// Classify turns any accepted input into (type, id).
+// UniProt accessions (e.g. P04637, Q9Y2T1) → type "protein".
+// Taxon IDs (numeric, e.g. 9606) → type "taxonomy".
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+
+	// Strip URL prefix if given; take the last non-empty path segment.
+	if u, e := url.Parse(input); e == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+		// walk backwards to find a non-empty, non-keyword segment
+		for i := len(parts) - 1; i >= 0; i-- {
+			seg := parts[i]
+			if seg != "" && seg != "entry" && seg != "uniprotkb" && seg != "taxonomy" {
+				input = seg
+				break
+			}
+		}
+	}
+
+	// Pure numeric → taxonomy
+	if _, e := strconv.Atoi(input); e == nil {
+		return "taxonomy", input, nil
+	}
+
+	// UniProt accession pattern: letter + digits + letter + digits (e.g. P04637, Q9Y2T1)
+	if isAccession(input) {
+		return "protein", strings.ToUpper(input), nil
+	}
+
+	return "", "", errs.Usage("unrecognized UniProt reference: %q (expected accession like P04637 or taxon ID like 9606)", input)
+}
+
+// isAccession returns true for a string that looks like a UniProt accession.
+// Format: [A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9] or [OPQ][0-9][A-Z0-9]{3}[0-9]
+// For simplicity we accept: 6-10 chars, starts with a letter, contains digits.
+func isAccession(s string) bool {
+	if len(s) < 6 || len(s) > 10 {
+		return false
+	}
+	hasLetter := false
+	hasDigit := false
+	for i, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			if i == 0 {
+				hasLetter = true
+			} else {
+				hasLetter = true
+			}
+		} else if r >= '0' && r <= '9' {
+			hasDigit = true
+		} else {
+			return false
+		}
+	}
+	return hasLetter && hasDigit
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "protein":
+		return fmt.Sprintf("https://www.uniprot.org/uniprotkb/%s/entry", id), nil
+	case "taxonomy":
+		return fmt.Sprintf("https://www.uniprot.org/taxonomy/%s", id), nil
+	default:
 		return "", errs.Usage("uniprot has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }

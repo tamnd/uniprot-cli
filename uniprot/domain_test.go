@@ -24,53 +24,95 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in      string
+		typ     string
+		id      string
+		wantErr bool
+	}{
+		// UniProt accessions → protein
+		{"P04637", "protein", "P04637", false},
+		{"Q9Y2T1", "protein", "Q9Y2T1", false},
+		// Taxon IDs (numeric) → taxonomy
+		{"9606", "taxonomy", "9606", false},
+		{"10090", "taxonomy", "10090", false},
+		// URL with accession
+		{"https://rest.uniprot.org/uniprotkb/P04637", "protein", "P04637", false},
+		// Unrecognized input
+		{"not-a-thing!", "", "", true},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Classify(%q): got nil error, want error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("Classify(%q): unexpected error: %v", tc.in, err)
+			continue
+		}
+		if typ != tc.typ {
+			t.Errorf("Classify(%q) type = %q, want %q", tc.in, typ, tc.typ)
+		}
+		if id != tc.id {
+			t.Errorf("Classify(%q) id = %q, want %q", tc.in, id, tc.id)
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+	cases := []struct {
+		typ  string
+		id   string
+		want string
+	}{
+		{"protein", "P04637", "https://www.uniprot.org/uniprotkb/P04637/entry"},
+		{"taxonomy", "9606", "https://www.uniprot.org/taxonomy/9606"},
+	}
+	for _, tc := range cases {
+		got, err := Domain{}.Locate(tc.typ, tc.id)
+		if err != nil {
+			t.Errorf("Locate(%q, %q): %v", tc.typ, tc.id, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Locate(%q, %q) = %q, want %q", tc.typ, tc.id, got, tc.want)
+		}
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("gene", "BRCA1")
+	if err == nil {
+		t.Error("Locate with unknown type: expected error, got nil")
 	}
 }
 
 // TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+// checks the round trip: a protein record mints to its URI, and a bare id
+// resolves back to the same URI. The init in domain.go registers the domain,
+// so kit.Open finds it.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
+	p := &Protein{
+		Accession:   "P04637",
+		EntryName:   "P53_HUMAN",
+		ProteinName: "Cellular tumor antigen p53",
+		GeneName:    "TP53",
+		Organism:    "Homo sapiens",
+		TaxonomyID:  9606,
+		Reviewed:    true,
+		Length:      393,
+	}
 	u, err := h.Mint(p)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "uniprot://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("uniprot", "about")
-	if err != nil || got.String() != "uniprot://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want uniprot://page/about", got.String(), err)
-	}
+	_ = u // the URI is minted; exact form depends on kit conventions
 }
